@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Matter.js スイカゲーム風パズル</title>
+
+<!-- ① CDN から Matter.js を読み込む（integrity は外す） -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+
+<style>
+    body{
+        margin:0;
+        background:#fafafa;
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        height:100vh;
+        font-family:sans-serif;
+    }
+    #game{
+        position:relative;
+    }
+    canvas{
+        background:#fff;
+        border:2px solid #333;
+    }
+    .ui{
+        position:absolute;
+        color:#333;
+        font-size:14px;
+        pointer-events:none;
+    }
+    #score{ top:5px; left:5px; }
+    #next { top:5px; right:5px; }
+    #gameover{
+        position:absolute;
+        top:0; left:0;
+        width:100%; height:100%;
+        background:rgba(0,0,0,0.6);
+        color:#fff;
+        display:flex;
+        justify-content:center;
+        align-items:center;
+        font-size:32px;
+        font-weight:bold;
+        visibility:hidden;   /* 隠しておく */
+    }
+</style>
+</head>
+<body>
+
+<div id="game">
+    <canvas id="canvas" width="400" height="600"></canvas>
+    <div id="score" class="ui">Score: 0</div>
+    <div id="next"  class="ui">Next: ?</div>
+    <div id="gameover">Game Over</div>
+</div>
+
+<script>
+(() => {
+    // -------------------------------------------------
+    // Matter.js の主要モジュールを取得
+    // -------------------------------------------------
+    const { Engine, Render, Runner, Bodies, Events, World, Body } = Matter;
+
+    // -------------------------------------------------
+    // 基本設定
+    // -------------------------------------------------
+    const WIDTH  = 400;
+    const HEIGHT = 600;
+    const engine = Engine.create();
+    const world  = engine.world;
+
+    const render = Render.create({
+        canvas: document.getElementById('canvas'),
+        engine: engine,
+        options: {
+            width: WIDTH,
+            height: HEIGHT,
+            wireframes: false,
+            background: '#fafafa'
+        }
+    });
+    Render.run(render);
+    // ピクセル比の自動拡大が入るとサイズがずれることがあるので 1 に固定
+    Render.setPixelRatio(render, 1);
+
+    const runner = Runner.create();
+    Runner.run(runner, engine);
+
+    // -------------------------------------------------
+    // フルーツレベル（サイズを一括で 0.6 倍に縮小）
+    // -------------------------------------------------
+    const SCALE = 0.6;                // ← ここを変えると全体の大きさが変わります
+    const LEVELS = [
+        { radius: Math.round(15  * SCALE), color:'#ff0000', name:'サクランボ' },
+        { radius: Math.round(20  * SCALE), color:'#f54242', name:'イチゴ' },
+        { radius: Math.round(28  * SCALE), color:'#a832ad', name:'ブドウ' },
+        { radius: Math.round(35  * SCALE), color:'#ffa500', name:'デコポン' },
+        { radius: Math.round(45  * SCALE), color:'#ff4500', name:'柿' },
+        { radius: Math.round(55  * SCALE), color:'#ff0800', name:'リンゴ' },
+        { radius: Math.round(68  * SCALE), color:'#fbff00', name:'梨' },
+        { radius: Math.round(82  * SCALE), color:'#ffc0cb', name:'桃' },
+        { radius: Math.round(100 * SCALE), color:'#ffee00', name:'パイナップル' },
+        { radius: Math.round(125 * SCALE), color:'#90ee90', name:'メロン' },
+        { radius: Math.round(150 * SCALE), color:'#006400', name:'スイカ' }
+    ];
+    const MAX_LEVEL = LEVELS.length - 1;
+
+    // -------------------------------------------------
+    // 壁（左右・底）
+    // -------------------------------------------------
+    const wallThick = 30;
+    const walls = [
+        // left
+        Bodies.rectangle(-wallThick/2, HEIGHT/2, wallThick, HEIGHT, { isStatic:true }),
+        // right
+        Bodies.rectangle(WIDTH + wallThick/2, HEIGHT/2, wallThick, HEIGHT, { isStatic:true }),
+        // bottom
+        Bodies.rectangle(WIDTH/2, HEIGHT + wallThick/2, WIDTH, wallThick, { isStatic:true })
+    ];
+    World.add(world, walls);
+
+    // -------------------------------------------------
+    // UI エレメント
+    // -------------------------------------------------
+    const scoreDiv = document.getElementById('score');
+    const nextDiv  = document.getElementById('next');
+    const overDiv  = document.getElementById('gameover');
+    let score = 0;
+    const setScore = v => { score = v; scoreDiv.textContent = `Score: ${score}`; };
+    setScore(0);
+
+    // -------------------------------------------------
+    // ゲーム状態
+    // -------------------------------------------------
+    const DEADLINE_Y = 5;          // 画面上端から 5px がデッドライン
+    const DEAD_STATIC_TOL = 0.12;  // 静止判定の速度閾値
+    let nextLevel   = null;       // UI に表示する次のレベル
+    let currentFruit = null;      // 落下させていないフルーツ（マウスで横移動中）
+    let cooldown    = false;      // 1 秒クールダウン中か
+    let gameOver    = false;
+    const deadTimers = new Map(); // デッドライン上で 3 秒停止したフルーツのタイマー管理
+
+    // -------------------------------------------------
+    // ヘルパー（フルーツ作成・削除）
+    // -------------------------------------------------
+    function createFruit(level, x, y, isStatic = true) {
+        const def = LEVELS[level];
+        const body = Bodies.circle(x, y, def.radius, {
+            label: 'fruit',
+            isStatic: isStatic,
+            friction: 0.001,
+            frictionAir: 0.02,
+            restitution: 0.2,
+            render: { fillStyle: def.color }
+        });
+        body.fruitLevel = level;   // カスタムプロパティ
+        body.fruitName  = def.name;
+        World.add(world, body);
+        return body;
+    }
+
+    function removeFruit(b) {
+        World.remove(world, b);
+    }
+
+    // -------------------------------------------------
+    // 次に投下するフルーツの決定（Level 0〜4 のランダム）と UI 更新
+    // -------------------------------------------------
+    function pickNextLevel() {
+        return Math.floor(Math.random() * 5);   // 0〜4
+    }
+
+    function updateNextUI() {
+        const def = LEVELS[nextLevel];
+        nextDiv.textContent = `Next: ${def.name}`;
+        nextDiv.style.color = def.color;
+    }
+
+    // -------------------------------------------------
+    // 新しいフルーツを画面**内**に配置する
+    // -------------------------------------------------
+    function startNewFruit() {
+        if (gameOver) return;
+        const x = WIDTH / 2;
+        // 上端から半径分離すれば「丸ごと」見える
+        const y = LEVELS[nextLevel].radius + 5;
+        currentFruit = createFruit(nextLevel, x, y, true);
+    }
+
+    function spawnFirstFruit() {
+        nextLevel = pickNextLevel();
+        updateNextUI();
+        startNewFruit();
+    }
+
+    spawnFirstFruit();
+
+    // -------------------------------------------------
+    // マウス操作（横移動 + クリックで落下）
+    // -------------------------------------------------
+    const canvas = render.canvas;
+
+    canvas.addEventListener('mousemove', e => {
+        if (!currentFruit || gameOver) return;
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const r = LEVELS[currentFruit.fruitLevel].radius;
+        // 画面外に出さないよう clamp
+        const clampedX = Math.min(Math.max(mouseX, r), WIDTH - r);
+        Body.setPosition(currentFruit, { x: clampedX, y: currentFruit.position.y });
+    });
+
+    canvas.addEventListener('mousedown', () => {
+        if (!currentFruit || cooldown || gameOver) return;
+
+        // 落下開始
+        Body.setStatic(currentFruit, false);
+        currentFruit = null;
+        cooldown = true;
+        setTimeout(() => { cooldown = false; }, 1000);
+
+        // 次のフルーツを決めて 1 秒後に生成
+        nextLevel = pickNextLevel();
+        updateNextUI();
+        setTimeout(startNewFruit, 1000);
+    });
+
+    // -------------------------------------------------
+    // 合体ロジック（同レベル同士が衝突したら 1 段階上のフルーツに）
+    // -------------------------------------------------
+    Events.on(engine, 'collisionStart', ev => {
+        ev.pairs.forEach(pair => {
+            const a = pair.bodyA, b = pair.bodyB;
+            if (!a || !b) return;
+            if (a.label !== 'fruit' || b.label !== 'fruit') return;
+            if (a.fruitLevel !== b.fruitLevel) return;
+            if (a.fruitLevel >= MAX_LEVEL) return; // スイカは合体しない
+
+            const newLevel = a.fruitLevel + 1;
+            const pos = {
+                x: (a.position.x + b.position.x) / 2,
+                y: (a.position.y + b.position.y) / 2
+            };
+            const vel = {
+                x: (a.velocity.x + b.velocity.x) / 2,
+                y: (a.velocity.y + b.velocity.y) / 2
+            };
+
+            removeFruit(a);
+            removeFruit(b);
+            const newFruit = createFruit(newLevel, pos.x, pos.y, false);
+            Body.setVelocity(newFruit, vel);
+
+            // スコアは・レベル+1 に 10 を掛けたもの（例: level3 → 40）
+            setScore(score + (newLevel + 1) * 10);
+        });
+    });
+
+    // -------------------------------------------------
+    // デッドライン判定（上端で 3 秒止まったら Game Over）
+    // -------------------------------------------------
+    Events.on(engine, 'beforeUpdate', () => {
+        if (gameOver) return;
+
+        world.bodies.forEach(b => {
+            if (b.label !== 'fruit') return;
+            const r = LEVELS[b.fruitLevel].radius;
+
+            // 画面内に入っているか＆落下中かを判定
+            const inside = (b.position.y + r > 0);
+            const moving = !b.isStatic;
+
+            if (inside && moving && b.position.y - r < DEADLINE_Y) {
+                const speed = Math.hypot(b.velocity.x, b.velocity.y);
+                if (speed < DEAD_STATIC_TOL) {
+                    // 静止状態が続くとタイマー開始
+                    if (!deadTimers.has(b)) {
+                        const to = setTimeout(() => { triggerGameOver(); }, 3000);
+                        deadTimers.set(b, to);
+                    }
+                } else {
+                    // 動いていたらタイマーリセット
+                    if (deadTimers.has(b)) {
+                        clearTimeout(deadTimers.get(b));
+                        deadTimers.delete(b);
+                    }
+                }
+            } else {
+                // デッドライン外、または静止前の状態はタイマーを削除
+                if (deadTimers.has(b)) {
+                    clearTimeout(deadTimers.get(b));
+                    deadTimers.delete(b);
+                }
+            }
+        });
+    });
+
+    function triggerGameOver() {
+        gameOver = true;
+        overDiv.style.visibility = 'visible';
+        // すべての物体を静止させる
+        world.bodies.forEach(b => Body.setStatic(b, true));
+    }
+
+    // -------------------------------------------------
+    // キーでリセット（R）※デバッグ用
+    // -------------------------------------------------
+    document.addEventListener('keydown', e => {
+        if (e.key === 'r' || e.key === 'R') location.reload();
+    });
+
+})();
+</script>
+
+</body>
+</html>
+

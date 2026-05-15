@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=400, user-scalable=no">
+    <title>SAKURA Suika Game - Merge & Density Fix</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: linear-gradient(135deg, #fff5f8 0%, #ffffff 100%);
+            font-family: 'Nunito', sans-serif;
+            overflow: hidden;
+            touch-action: none;
+        }
+        #game-container {
+            position: relative;
+            width: 400px;
+            height: 600px;
+            background: #ffffff;
+            border: 6px solid #e3007f;
+            border-radius: 24px;
+            box-shadow: 0 15px 35px rgba(227, 0, 127, 0.2);
+            overflow: hidden;
+        }
+        canvas { display: block; }
+        #particle-canvas {
+            position: absolute;
+            top: 0; left: 0;
+            pointer-events: none;
+            z-index: 8;
+        }
+        #deadline {
+            position: absolute;
+            top: 130px;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            border-top: 2px dotted #e3007f;
+            box-shadow: 0 0 10px #e3007f;
+            z-index: 5;
+        }
+        .panel {
+            position: absolute;
+            top: 15px;
+            padding: 10px 15px;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(8px);
+            border-radius: 15px;
+            color: #e3007f;
+            font-weight: bold;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+            z-index: 20;
+        }
+        #score-panel { left: 15px; font-size: 18px; }
+        #next-panel { right: 15px; display: flex; align-items: center; gap: 8px; }
+        #next-img { width: 40px; height: 40px; object-fit: contain; }
+        #game-over {
+            position: absolute;
+            inset: 0;
+            background: rgba(227, 0, 127, 0.85);
+            color: white;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+            font-size: 40px;
+        }
+        #game-over button {
+            margin-top: 20px;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 50px;
+            background: white;
+            color: #e3007f;
+            font-weight: bold;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div id="deadline"></div>
+    <canvas id="game-canvas"></canvas>
+    <canvas id="particle-canvas"></canvas>
+    <div id="score-panel" class="panel">Score: 0</div>
+    <div id="next-panel" class="panel">
+        <span style="font-size: 12px;">Next</span>
+        <img id="next-img" src="" alt="next">
+    </div>
+    <div id="game-over">
+        <div>GAME OVER</div>
+        <button onclick="location.reload()">Retry</button>
+    </div>
+</div>
+
+<script>
+(() => {
+    const { Engine, Render, Runner, Bodies, World, Body, Events } = Matter;
+
+    const WIDTH = 400;
+    const HEIGHT = 600;
+    const ASSET_PATH = './';
+    const SPAWN_Y = 90;
+
+    const LEVELS = [
+        { r: 12,  score: 2,   src: '1.png' }, 
+        { r: 18,  score: 4,   src: '2.png' }, 
+        { r: 22,  score: 8,   src: '3.png' }, 
+        { r: 27,  score: 16,  src: '4.png' }, 
+        { r: 30,  score: 32,  src: '5.png' }, 
+        { r: 42,  score: 64,  src: '6.png' }, 
+        { r: 55,  score: 128, src: '7.png' }, 
+        { r: 65,  score: 256, src: '8.png' }, 
+        { r: 84,  score: 512, src: '9.png' }, 
+        { r: 100, score: 1024,src: '10.png' },
+        { r: 120, score: 2048,src: '11.png' } 
+    ];
+
+    let engine, world, render, runner;
+    let currentFruit = null;
+    let nextLevel = Math.floor(Math.random() * 5);
+    let score = 0;
+    let isClickable = true;
+    let isGameOver = false;
+    const deadTimers = new Map();
+
+    const pCanvas = document.getElementById('particle-canvas');
+    const pCtx = pCanvas.getContext('2d');
+    pCanvas.width = WIDTH; pCanvas.height = HEIGHT;
+    let particles = [];
+
+    function preload(callback) {
+        let loaded = 0;
+        LEVELS.forEach(lvl => {
+            const img = new Image();
+            img.src = ASSET_PATH + lvl.src;
+            img.onload = () => { if (++loaded === LEVELS.length) callback(); };
+            img.onerror = () => { if (++loaded === LEVELS.length) callback(); };
+        });
+    }
+
+    function init() {
+        engine = Engine.create();
+        world = engine.world;
+
+        render = Render.create({
+            canvas: document.getElementById('game-canvas'),
+            engine: engine,
+            options: { width: WIDTH, height: HEIGHT, wireframes: false, background: 'transparent' }
+        });
+
+        const wallOpt = { isStatic: true, render: { visible: false } };
+        World.add(world, [
+            Bodies.rectangle(WIDTH/2, HEIGHT + 25, WIDTH, 50, wallOpt),
+            Bodies.rectangle(-25, HEIGHT/2, 50, HEIGHT, wallOpt),
+            Bodies.rectangle(WIDTH + 25, HEIGHT/2, 50, HEIGHT, wallOpt)
+        ]);
+
+        Render.run(render);
+        runner = Runner.create();
+        Runner.run(runner, engine);
+
+        createNextFruit();
+        addEventListeners();
+        updateLoop();
+    }
+
+    function createFruit(level, x, y, isStatic = false) {
+        const lvl = LEVELS[level];
+        
+        // 物理判定の半径はそのまま(1.0倍)にして確実に衝突させる
+        const fruit = Bodies.circle(x, y, lvl.r, {
+            label: 'fruit',
+            isStatic: isStatic,
+            restitution: 0.2, // 少しだけ弾むようにして重なりを解消しやすくする
+            friction: 0.1,
+            render: {
+                sprite: {
+                    texture: ASSET_PATH + lvl.src,
+                    // 画像の見た目を少し大きく(2.3倍)して、判定の境界を隠す
+                    xScale: (lvl.r * 2.3) / 300,
+                    yScale: (lvl.r * 2.3) / 300
+                }
+            }
+        });
+        fruit.level = level;
+        World.add(world, fruit);
+        return fruit;
+    }
+
+    function createNextFruit() {
+        if (isGameOver) return;
+        const lvl = LEVELS[nextLevel];
+        document.getElementById('next-img').src = ASSET_PATH + lvl.src;
+        currentFruit = createFruit(nextLevel, WIDTH/2, SPAWN_Y, true);
+    }
+
+    function addEventListeners() {
+        const container = document.getElementById('game-container');
+
+        container.addEventListener('mousemove', (e) => {
+            if (!currentFruit || !isClickable || isGameOver) return;
+            const rect = container.getBoundingClientRect();
+            let x = e.clientX - rect.left;
+            const r = LEVELS[currentFruit.level].r;
+            x = Math.max(r, Math.min(WIDTH - r, x));
+            Body.setPosition(currentFruit, { x: x, y: SPAWN_Y });
+        });
+
+        container.addEventListener('mousedown', () => {
+            if (!currentFruit || !isClickable || isGameOver) return;
+            isClickable = false;
+            Body.setStatic(currentFruit, false);
+
+            setTimeout(() => {
+                nextLevel = Math.floor(Math.random() * 5);
+                createNextFruit();
+                isClickable = true;
+            }, 800);
+        });
+
+        // 衝突イベント
+        Events.on(engine, 'collisionStart', (event) => {
+            event.pairs.forEach(pair => {
+                const { bodyA: a, bodyB: b } = pair;
+                // 両方がフルーツであり、同じレベルであるか
+                if (a.label === 'fruit' && b.label === 'fruit' && a.level === b.level) {
+                    if (a.level < LEVELS.length - 1) {
+                        const newLevel = a.level + 1;
+                        const midX = (a.position.x + b.position.x) / 2;
+                        const midY = (a.position.y + b.position.y) / 2;
+                        
+                        // すでに消去リストに入っている場合はスキップ
+                        World.remove(world, [a, b]);
+                        createFruit(newLevel, midX, midY);
+                        
+                        score += LEVELS[newLevel].score;
+                        document.getElementById('score-panel').innerText = "Score: " + score;
+                        spawnParticles(midX, midY);
+                    }
+                }
+            });
+        });
+    }
+
+    function spawnParticles(x, y) {
+        for (let i = 0; i < 12; i++) {
+            particles.push({
+                x, y,
+                vx: (Math.random() - 0.5) * 8,
+                vy: (Math.random() - 0.5) * 8,
+                life: 1.0,
+                size: Math.random() * 6 + 2
+            });
+        }
+    }
+
+    function updateLoop() {
+        pCtx.clearRect(0, 0, WIDTH, HEIGHT);
+        particles = particles.filter(p => {
+            p.x += p.vx; p.y += p.vy; p.life -= 0.02;
+            pCtx.fillStyle = `rgba(227, 0, 127, ${p.life})`;
+            pCtx.beginPath(); pCtx.arc(p.x, p.y, p.size, 0, Math.PI*2); pCtx.fill();
+            return p.life > 0;
+        });
+
+        if (!isGameOver) {
+            world.bodies.forEach(body => {
+                if (body.label === 'fruit' && !body.isStatic) {
+                    if (body.position.y < 130 && Math.abs(body.velocity.y) < 0.2) {
+                        if (!deadTimers.has(body)) {
+                            deadTimers.set(body, Date.now());
+                        } else if (Date.now() - deadTimers.get(body) > 2000) {
+                            isGameOver = true;
+                            document.getElementById('game-over').style.display = 'flex';
+                        }
+                    } else {
+                        deadTimers.delete(body);
+                    }
+                }
+            });
+        }
+        requestAnimationFrame(updateLoop);
+    }
+
+    preload(init);
+})();
+</script>
+</body>
+</html>
